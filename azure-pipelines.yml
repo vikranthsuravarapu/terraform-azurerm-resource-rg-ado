@@ -1,0 +1,217 @@
+# ═══════════════════════════════════════════════════════════════════
+# ADO Terraform Pipeline — Manual Trigger with Create / Destroy
+# Service Connection: subscriptionauthenticator
+# ═══════════════════════════════════════════════════════════════════
+
+# ── No automatic trigger — manual only ──────────────────────────
+trigger: none
+pr: none
+
+# ── Agent ────────────────────────────────────────────────────────
+pool:
+  vmImage: ubuntu-latest
+
+# ── Manual Parameters — shown as dropdown when you queue the pipeline
+parameters:
+
+  - name: action
+    displayName: "Action — What do you want to do?"
+    type: string
+    default: Create
+    values:
+      - Create
+      - Destroy
+
+  - name: environment
+    displayName: "Target Environment"
+    type: string
+    default: dev
+    values:
+      - dev
+      - staging
+      - prod
+
+  - name: location
+    displayName: "Azure Region"
+    type: string
+    default: westeurope
+    values:
+      - westeurope
+      - northeurope
+      - eastus
+      - southindia
+
+# ── Variables ────────────────────────────────────────────────────
+variables:
+  - name: terraformVersion
+    value: "1.7.0"
+  - name: backendResourceGroup
+    value: "rg-terraform-state"
+  - name: backendStorageAccount
+    value: "terraformstatestorage295"
+  - name: backendContainer
+    value: "tfstate"
+  - name: stateFile
+    value: "tfstate"
+  - name: workingDirectory
+    value: "$(System.DefaultWorkingDirectory)/terraform"
+
+# ═══════════════════════════════════════════════════════════════════
+# STAGE 1 — VALIDATE
+# Always runs first regardless of Create or Destroy
+# ═══════════════════════════════════════════════════════════════════
+stages:
+
+  - stage: Validate
+    displayName: "🔍 Validate — ${{ parameters.action }} on ${{ parameters.environment }}"
+    jobs:
+      - job: TerraformValidate
+        displayName: "Terraform Init & Validate"
+        steps:
+
+          # Install specific Terraform version
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform ${{ variables.terraformVersion }}"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          # Init with Azure backend — uses service connection
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Init"
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: $(workingDirectory)
+              backendServiceArm: subscriptionauthenticator      # ← your service connection
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainer)
+              backendAzureRmKey: $(stateFile)
+
+          # Validate syntax
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Validate"
+            inputs:
+              provider: azurerm
+              command: validate
+              workingDirectory: $(workingDirectory)
+              environmentServiceNameAzureRM: subscriptionauthenticator
+
+# ═══════════════════════════════════════════════════════════════════
+# STAGE 2 — PLAN
+# Runs for both Create and Destroy (plan shows what will happen)
+# ═══════════════════════════════════════════════════════════════════
+
+  - stage: Plan
+    displayName: "📋 Plan — ${{ parameters.action }}"
+    dependsOn: Validate
+    jobs:
+      - job: TerraformPlan
+        displayName: "Terraform Plan"
+        steps:
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: $(terraformVersion)
+
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Init"
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: $(workingDirectory)
+              backendServiceArm: subscriptionauthenticator
+              backendAzureRmResourceGroupName: $(backendResourceGroup)
+              backendAzureRmStorageAccountName: $(backendStorageAccount)
+              backendAzureRmContainerName: $(backendContainer)
+              backendAzureRmKey: $(stateFile)
+
+          # Plan for CREATE
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Plan — Create"
+            condition: eq('${{ parameters.action }}', 'Create')
+            inputs:
+              provider: azurerm
+              command: plan
+              workingDirectory: $(workingDirectory)
+              commandOptions: >
+                -out=tfplan
+                -var="environment=${{ parameters.environment }}"
+                -var="location=${{ parameters.location }}"
+              environmentServiceNameAzureRM: subscriptionauthenticator
+
+          # Plan for DESTROY
+          - task: TerraformTaskV4@4
+            displayName: "Terraform Plan — Destroy"
+            condition: eq('${{ parameters.action }}', 'Destroy')
+            inputs:
+              provider: azurerm
+              command: plan
+              workingDirectory: $(workingDirectory)
+              commandOptions: >
+                -destroy
+                -out=tfplan
+                -var="environment=${{ parameters.environment }}"
+                -var="location=${{ parameters.location }}"
+              environmentServiceNameAzureRM: subscriptionauthenticator
+
+          # Save plan artifact for Apply stage
+          - task: PublishPipelineArtifact@1
+            displayName: "Save Plan Artifact"
+            inputs:
+              targetPath: "$(workingDirectory)/tfplan"
+              artifact: terraform-plan
+
+# ═══════════════════════════════════════════════════════════════════
+# STAGE 3 — APPLY / DESTROY
+# Requires manual approval before running
+# ═══════════════════════════════════════════════════════════════════
+
+  - stage: Apply
+    displayName: "🚀 ${{ parameters.action }} — ${{ parameters.environment }}"
+    dependsOn: Plan
+    jobs:
+      - deployment: TerraformApply
+        displayName: "${{ parameters.action }} Infrastructure"
+        # ↓ Approval gate configured in ADO Portal → Environments
+        environment: ${{ parameters.environment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - task: TerraformInstaller@1
+                  displayName: "Install Terraform"
+                  inputs:
+                    terraformVersion: $(terraformVersion)
+
+                - task: TerraformTaskV4@4
+                  displayName: "Terraform Init"
+                  inputs:
+                    provider: azurerm
+                    command: init
+                    workingDirectory: $(workingDirectory)
+                    backendServiceArm: subscriptionauthenticator
+                    backendAzureRmResourceGroupName: $(backendResourceGroup)
+                    backendAzureRmStorageAccountName: $(backendStorageAccount)
+                    backendAzureRmContainerName: $(backendContainer)
+                    backendAzureRmKey: $(stateFile)
+
+                # Download the saved plan
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download Plan Artifact"
+                  inputs:
+                    artifact: terraform-plan
+                    path: $(workingDirectory)
+
+                # Apply (works for both create and destroy
+                # because plan already has -destroy flag baked in)
+                - task: TerraformTaskV4@4
+                  displayName: "Terraform ${{ parameters.action }}"
+                  inputs:
+                    provider: azurerm
+                    command: apply
+                    workingDirectory: $(workingDirectory)
+                    commandOptions: "-auto-approve tfplan"
+                    environmentServiceNameAzureRM: subscriptionauthenticator
